@@ -1,12 +1,6 @@
 # ext4tool
 
-Extracts files from ext4 filesystem images. Written in Rust.
-
-## What it does
-
-Takes an ext4 image (raw .img or Android sparse .simg) and dumps all files to a directory. Preserves permissions, SELinux labels, capabilities, symlinks, and xattrs where the OS supports it.
-
-Output includes Android-compatible `fs_config` and `file_contexts` files for rebuilding images.
+Extracts files from ext4 filesystem images and builds ext4 images from directories. Written in Rust.
 
 ## Build
 
@@ -19,7 +13,17 @@ No dependencies beyond Rust. Binary ends up at `target/release/ext4tool`.
 ## Usage
 
 ```
-ext4tool -i <image> -o <output_dir>
+ext4tool <command> [options]
+
+Commands:
+  extract    Extract files from an ext4 image
+  build      Build an ext4 image from a source directory
+```
+
+### Extract
+
+```
+ext4tool extract -i <image> -o <output_dir>
 
   -i, --input      ext4 image file (.img or .simg)
   -o, --output     output directory
@@ -27,11 +31,27 @@ ext4tool -i <image> -o <output_dir>
   -t, --threads    number of worker threads (default: 4)
 ```
 
-Examples:
+Extracts all files from an ext4 image, preserving permissions, SELinux labels, capabilities, symlinks, and xattrs where supported. Output includes Android-compatible `fs_config` and `file_contexts` files for rebuilding images.
 
 ```sh
-ext4tool -i system.img -o out/
-ext4tool -i vendor.simg -o out/ --keep-raw -t 8
+ext4tool extract -i system.img -o out/
+ext4tool extract -i vendor.simg -o out/ --keep-raw -t 8
+```
+
+### Build
+
+```
+ext4tool build -i <src_dir> -o <image> -s <size_mb>
+
+  -i, --input     source directory
+  -o, --output    ext4 image file (.img)
+  -s, --size      target image size in MB
+```
+
+Builds an ext4 filesystem image from a source directory. Supports regular files, directories, and symlinks. Permissions (mode bits) are preserved. The resulting image passes `e2fsck` cleanly and is mountable via `mount -o loop`.
+
+```sh
+ext4tool build -i my_rootfs/ -o rootfs.img -s 256
 ```
 
 ## Caveats
@@ -41,7 +61,7 @@ ext4tool -i vendor.simg -o out/ --keep-raw -t 8
 - `chown` requires root on Linux.
 - Windows symlink creation uses MSYS2-compatible reparse points (`!<symlink>` + `attrib +s`). Requires Windows 10+ with Developer Mode for native NTFS symlinks; otherwise falls back to MSYS2-style reparse files which work with MSYS2 `mkfs.ext4`.
 
-## How it works
+## How extraction works
 
 Single-pass traversal + concurrent extraction:
 
@@ -55,6 +75,19 @@ Metadata files go in `<output_dir>/config/`:
 - `<name>_size.txt` — image size
 - `<name>_name.txt` — partition name
 - `<name>_space.txt` — files with spaces (if any)
+
+## How building works
+
+Two-phase build:
+
+1. **Walk + assign**: scan the source directory, build a file tree, and assign inode numbers.
+2. **BFS write**: write inodes, directory blocks, and file data level-by-level (parents before children) so that directory entries always reference existing inodes.
+
+Internal details:
+- 4096-byte blocks, 256-byte inodes, 2048 inodes/group, 32768 blocks/group
+- Extent-based file storage (single contiguous extent per file)
+- Inline symlinks (< 60 bytes stored directly in i_block)
+- No journal, 64-bit addressing, metadata_csum, or resize_inode features
 
 ## Sparse images
 
