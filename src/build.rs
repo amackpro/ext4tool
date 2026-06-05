@@ -11,6 +11,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 
+// ── Sparse superblock helpers ──────────────────────────────────────────────────
+fn is_power_of(n: u32, base: u32) -> bool {
+    if n == 0 { return false; }
+    let mut p = 1u64;
+    while p < n as u64 {
+        p = p.wrapping_mul(base as u64);
+        if p > n as u64 { return false; }
+    }
+    p == n as u64
+}
+
+fn has_sparse_super(group: u32) -> bool {
+    group == 0 || group == 1
+        || is_power_of(group, 3)
+        || is_power_of(group, 5)
+        || is_power_of(group, 7)
+}
+
 // ── Geometry ──────────────────────────────────────────────────────────────────
 const BLOCK_SIZE: u64 = 4096;
 const INODE_SIZE: u16 = 256;
@@ -72,18 +90,14 @@ pub struct Builder {
     total_blocks: u64,
     total_inodes: u32,
 
-    // Per-group metadata block counts
-    #[allow(dead_code)]
-    metadata_blocks: u64,    // blocks consumed by sb + gdt + bm + im + itable per group
-    #[allow(dead_code)]
-    first_data_block: u64,   // first usable data block (group-relative, absolute for group 0)
+    itable_blocks: u64,      // inode table blocks per group
 
     // Allocation trackers
     next_inode: u32,
     next_data_block: u64,    // absolute block number
     block_bitmap: Vec<u8>,
     inode_bitmap: Vec<u8>,
-    dir_count: u16,
+    dir_count_group: Vec<u16>,
 
     file: fs::File,
 }
@@ -97,16 +111,27 @@ impl Builder {
         let total_inodes = num_groups * INODES_PER_GROUP;
 
         let itable_blocks = ((INODES_PER_GROUP as u64 * INODE_SIZE as u64) + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        let metadata_blocks = 4 + itable_blocks; // sb + gdt + bm + im + itable
 
-        let bm_bytes = (BLOCKS_PER_GROUP as u64 + 7) / 8;
+        // Full block bitmap covering all blocks
+        let bm_bytes = (total_blocks + 7) / 8;
         let mut block_bitmap = vec![0u8; bm_bytes as usize];
-        // Mark all metadata blocks in group 0 as used
-        for b in 0..metadata_blocks {
-            set_bit(&mut block_bitmap, b);
+        // Mark metadata blocks for each group as used (respecting sparse_super)
+        for g in 0..num_groups {
+            let base = g as u64 * BLOCKS_PER_GROUP as u64;
+            // Groups with backup superblock have sb+GDT at blocks 0-1.
+            // All groups have block bitmap (+2), inode bitmap (+3), inode table (+4..+3+itable).
+            let meta_start: u64 = if has_sparse_super(g) { 0 } else { 2 };
+            let meta_end = 4 + itable_blocks; // bm + im + itable = 2 + 128, plus sb+gdt for sparse
+            for b in meta_start..meta_end {
+                let block = base + b;
+                if block < total_blocks {
+                    set_bit(&mut block_bitmap, block);
+                }
+            }
         }
 
-        let im_bytes = (INODES_PER_GROUP as u64 + 7) / 8;
+        // Full inode bitmap covering all inodes
+        let im_bytes = (total_inodes as u64 + 7) / 8;
         let mut inode_bitmap = vec![0u8; im_bytes as usize];
         // Mark reserved inodes 0-11 as used
         for i in 0..12u64 {
@@ -118,6 +143,8 @@ impl Builder {
         file.set_len(total_size)
             .with_context(|| "Failed to allocate output file")?;
 
+        let first_data = 4 + itable_blocks;
+
         let mut b = Builder {
             block_size: BLOCK_SIZE,
             inode_size: INODE_SIZE,
@@ -126,13 +153,12 @@ impl Builder {
             num_groups,
             total_blocks,
             total_inodes,
-            metadata_blocks,
-            first_data_block: metadata_blocks,
+            itable_blocks,
             next_inode: EXT4_FIRST_USER_INO,
-            next_data_block: metadata_blocks,
+            next_data_block: first_data,
             block_bitmap,
             inode_bitmap,
-            dir_count: 0,
+            dir_count_group: vec![0u16; num_groups as usize],
             file,
         };
 
@@ -147,19 +173,39 @@ impl Builder {
         let ino = self.next_inode;
         self.next_inode += 1;
         let idx = (ino - 1) as u64;
-        if idx < self.inodes_per_group as u64 {
-            set_bit(&mut self.inode_bitmap, idx);
-        }
+        set_bit(&mut self.inode_bitmap, idx);
         ino
     }
 
-    fn alloc_blocks(&mut self, count: u64) -> u64 {
-        let start = self.next_data_block;
-        self.next_data_block += count;
-        for b in start..start + count {
-            set_bit(&mut self.block_bitmap, b);
+    fn alloc_blocks(&mut self, count: u64) -> Vec<(u64, u64)> {
+        let mut segments = Vec::new();
+        let mut actual = self.next_data_block;
+        let mut remaining = count;
+        while remaining > 0 {
+            let group = (actual / self.blocks_per_group as u64) as u32;
+            let group_base = group as u64 * self.blocks_per_group as u64;
+            let group_data_start = group_base + 4 + self.itable_blocks;
+            let group_data_end = group_base + self.blocks_per_group as u64;
+            if actual >= group_data_end {
+                actual = group_data_end + 4 + self.itable_blocks;
+                continue;
+            }
+            if actual < group_data_start {
+                actual = group_data_start;
+            }
+            let available = group_data_end - actual;
+            let take = remaining.min(available);
+            for b in actual..actual + take {
+                set_bit(&mut self.block_bitmap, b);
+            }
+            if take > 0 {
+                segments.push((actual, take));
+            }
+            actual += take;
+            remaining -= take;
         }
-        start
+        self.next_data_block = actual;
+        segments
     }
 
     fn free_blocks(&self) -> u64 {
@@ -170,6 +216,30 @@ impl Builder {
     fn free_inodes(&self) -> u32 {
         let used: u64 = self.inode_bitmap.iter().map(|b| b.count_ones() as u64).sum();
         (self.total_inodes as u64).saturating_sub(used) as u32
+    }
+
+    fn free_blocks_for_group(&self, group: u32) -> u16 {
+        let base = group as u64 * self.blocks_per_group as u64;
+        let end = (base + self.blocks_per_group as u64).min(self.total_blocks);
+        let mut used = 0u64;
+        for b in base..end {
+            if get_bit(&self.block_bitmap, b) {
+                used += 1;
+            }
+        }
+        (end - base - used) as u16
+    }
+
+    fn free_inodes_for_group(&self, group: u32) -> u16 {
+        let base = group as u64 * self.inodes_per_group as u64;
+        let end = (base + self.inodes_per_group as u64).min(self.total_inodes as u64);
+        let mut used = 0u64;
+        for i in base..end {
+            if get_bit(&self.inode_bitmap, i) {
+                used += 1;
+            }
+        }
+        (end - base - used) as u16
     }
 
     // ── Superblock ──────────────────────────────────────────────────────────
@@ -264,9 +334,6 @@ impl Builder {
         let gdt_offset = 1 * self.block_size;
         self.file.seek(SeekFrom::Start(gdt_offset))?;
 
-        let fb = self.free_blocks() as u16;
-        let fi = self.free_inodes() as u16;
-
         for g in 0..self.num_groups {
             let base_block = g as u64 * self.blocks_per_group as u64;
 
@@ -286,17 +353,12 @@ impl Builder {
             w32(&mut gd, 0x00, (base_block + 2) as u32);            // bg_block_bitmap_lo
             w32(&mut gd, 0x04, (base_block + 3) as u32);            // bg_inode_bitmap_lo
             w32(&mut gd, 0x08, (base_block + 4) as u32);            // bg_inode_table_lo
-            w16(&mut gd, 0x0C, fb);                                  // bg_free_blocks_count_lo
-            w16(&mut gd, 0x0E, fi);                                  // bg_free_inodes_count_lo
-            w16(&mut gd, 0x10, self.dir_count);                      // bg_used_dirs_count_lo
+            w16(&mut gd, 0x0C, self.free_blocks_for_group(g));       // bg_free_blocks_count_lo
+            w16(&mut gd, 0x0E, self.free_inodes_for_group(g));       // bg_free_inodes_count_lo
+            w16(&mut gd, 0x10, self.dir_count_group[g as usize]);    // bg_used_dirs_count_lo
             w16(&mut gd, 0x12, 0);                                   // bg_flags
 
             self.file.write_all(&gd)?;
-            // Pad remaining descriptor area to block boundary
-            let pad = self.block_size as usize - gd.len();
-            if pad > 0 && g == self.num_groups - 1 {
-                // Only need to pad after the last descriptor
-            }
         }
 
         // Pad the entire group descriptor table to one block
@@ -317,7 +379,10 @@ impl Builder {
             return Ok(());
         }
         let idx = (inode_num - 1) as u64;
-        let pos = 4 * self.block_size + idx * self.inode_size as u64;
+        let group = idx / self.inodes_per_group as u64;
+        let in_group = idx % self.inodes_per_group as u64;
+        let table_block = group * self.blocks_per_group as u64 + 4;
+        let pos = table_block * self.block_size + in_group * self.inode_size as u64;
         self.file.seek(SeekFrom::Start(pos))?;
         self.file.write_all(data)?;
         Ok(())
@@ -417,38 +482,8 @@ impl Builder {
 
     // ── Directory blocks ───────────────────────────────────────────────────
 
-    fn make_dir_block(entries: &[(u32, &[u8], u8)], block_size: u64) -> Vec<u8> {
-        let mut block = vec![0u8; block_size as usize];
-        let mut off = 0usize;
-
-        for (i, &(inode, name, file_type)) in entries.iter().enumerate() {
-            let raw_len = 8 + name.len();
-            let padded = ((raw_len + 3) / 4) * 4;
-            let is_last = i == entries.len() - 1;
-            let rec_len = if is_last {
-                block_size as usize - off
-            } else {
-                padded
-            };
-
-            let mut tmp2 = [0u8; 2];
-            let mut tmp4 = [0u8; 4];
-
-            LittleEndian::write_u32(&mut tmp4, inode);
-            block[off..off + 4].copy_from_slice(&tmp4);
-            LittleEndian::write_u16(&mut tmp2, rec_len as u16);
-            block[off + 4..off + 6].copy_from_slice(&tmp2);
-            block[off + 6] = name.len() as u8;
-            block[off + 7] = file_type;
-            block[off + 8..off + 8 + name.len()].copy_from_slice(name);
-
-            off += rec_len;
-            if off >= block_size as usize {
-                break;
-            }
-        }
-
-        block
+    fn make_dir_block_owned(entries: &[(u32, Vec<u8>, u8)], block_size: u64) -> Vec<u8> {
+        make_dir_block_copy(entries, block_size)
     }
 
     // ── Build from source directory ────────────────────────────────────────
@@ -535,14 +570,17 @@ impl Builder {
         queue.push_back((PathBuf::from(""), root_inode_num, root_children));
 
         while let Some((parent_rel, parent_ino, children)) = queue.pop_front() {
-            self.dir_count += 1;
+            let dir_group = ((parent_ino - 1) / self.inodes_per_group) as usize;
+            if dir_group < self.dir_count_group.len() {
+                self.dir_count_group[dir_group] += 1;
+            }
             // Count subdirectories for links_count
             let subdir_count = children.iter()
                 .filter(|c| c.file_type == FileType::Directory)
                 .count() as u16;
 
             // Build directory entries: ., .., children
-            let mut entries = Vec::new();
+            let mut entries: Vec<(u32, Vec<u8>, u8)> = Vec::new();
 
             // Compute parent's parent inode for ..
             let parent_parent_ino = if parent_rel.as_os_str().is_empty() {
@@ -560,8 +598,8 @@ impl Builder {
                 path_to_inode.get(&grandparent_rel).copied().unwrap_or(root_inode_num)
             };
 
-            entries.push((parent_ino, b"." as &[u8], EXT4_FT_DIR));
-            entries.push((parent_parent_ino, b".." as &[u8], EXT4_FT_DIR));
+            entries.push((parent_ino, b".".to_vec(), EXT4_FT_DIR));
+            entries.push((parent_parent_ino, b"..".to_vec(), EXT4_FT_DIR));
 
             for child in &children {
                 let ft = match child.file_type {
@@ -570,22 +608,33 @@ impl Builder {
                     FileType::Symlink => EXT4_FT_SYMLINK,
                     _ => EXT4_FT_REG_FILE,
                 };
-                entries.push((child.inode, child.name.as_bytes(), ft));
+                entries.push((child.inode, child.name.as_bytes().to_vec(), ft));
             }
 
-            // Allocate block(s) for the directory and write data
-            let dir_data = Self::make_dir_block(&entries, self.block_size);
+            let dir_data = Self::make_dir_block_owned(&entries, self.block_size);
             let nblocks = (dir_data.len() as u64 + self.block_size - 1) / self.block_size;
-            let start_block = self.alloc_blocks(nblocks);
+            let segments = self.alloc_blocks(nblocks);
 
-            let file_off = start_block * self.block_size;
-            self.file.seek(SeekFrom::Start(file_off))?;
-            self.file.write_all(&dir_data)?;
-
+            // Write directory data to each segment
+            let mut written = 0usize;
+            for &(seg_start, seg_nblocks) in &segments {
+                let file_off = seg_start * self.block_size;
+                self.file.seek(SeekFrom::Start(file_off))?;
+                let end = (written + seg_nblocks as usize * self.block_size as usize).min(dir_data.len());
+                self.file.write_all(&dir_data[written..end])?;
+                written = end;
+            }
             // Write/update inode for this directory
             let i_blocks_512 = (nblocks * (self.block_size / 512)) as u32;
-            let extent = [(0u32, nblocks as u16, start_block)];
-            let ib = Self::extent_root(&extent);
+            let extent_entries: Vec<(u32, u16, u64)> = {
+                let mut logical = 0u32;
+                segments.iter().map(|&(start, count)| {
+                    let entry = (logical, count as u16, start);
+                    logical += count as u32;
+                    entry
+                }).collect()
+            };
+            let ib = Self::extent_root(&extent_entries);
             let entry = all_entries.get(&parent_ino)
                 .expect("directory entry missing");
             let mode = entry.mode | 0o040000; // S_IFDIR
@@ -629,13 +678,9 @@ impl Builder {
         } else {
             (size + self.block_size - 1) / self.block_size
         };
-        let start_block = self.alloc_blocks(nblocks);
+        let segments = self.alloc_blocks(nblocks);
 
-        // Write file data (zero-filled for empty files)
-        let file_off = start_block * self.block_size;
-        self.file.seek(SeekFrom::Start(file_off))?;
-
-        // Read source file
+        // Write file data to each segment, skipping metadata blocks
         let src_path = entry.source_path.as_ref()
             .expect("file entry missing source path");
         if size > 0 {
@@ -643,30 +688,47 @@ impl Builder {
                 .with_context(|| format!("Failed to open {}", src_path.display()))?;
             let mut written = 0u64;
             let mut buf = vec![0u8; self.block_size as usize];
-            loop {
-                if written >= size {
-                    break;
+            for &(seg_start, seg_nblocks) in &segments {
+                let file_off = seg_start * self.block_size;
+                self.file.seek(SeekFrom::Start(file_off))?;
+                for _ in 0..seg_nblocks {
+                    let to_read = (size - written).min(self.block_size) as usize;
+                    if to_read == 0 {
+                        break;
+                    }
+                    let n = src_f.read(&mut buf[..to_read])?;
+                    if n == 0 {
+                        break;
+                    }
+                    self.file.write_all(&buf[..n])?;
+                    if n < self.block_size as usize {
+                        let zeros = vec![0u8; self.block_size as usize - n];
+                        self.file.write_all(&zeros)?;
+                    }
+                    written += n as u64;
                 }
-                let to_read = (size - written).min(self.block_size);
-                let n = src_f.read(&mut buf[..to_read as usize])?;
-                if n == 0 {
-                    break;
-                }
-                self.file.write_all(&buf[..n])?;
-                // Pad to block boundary
-                if (n as u64) < self.block_size {
-                    let zeros = vec![0u8; self.block_size as usize - n];
-                    self.file.write_all(&zeros)?;
-                }
-                written += n as u64;
             }
         } else {
-            let zeros = vec![0u8; self.block_size as usize];
-            self.file.write_all(&zeros)?;
+            for &(seg_start, seg_nblocks) in &segments {
+                let file_off = seg_start * self.block_size;
+                self.file.seek(SeekFrom::Start(file_off))?;
+                for _ in 0..seg_nblocks {
+                    let zeros = vec![0u8; self.block_size as usize];
+                    self.file.write_all(&zeros)?;
+                }
+            }
         }
 
-        let extent = [(0u32, nblocks as u16, start_block)];
-        let ib = Self::extent_root(&extent);
+        // Build extents from segments
+        let extent_entries: Vec<(u32, u16, u64)> = {
+            let mut logical = 0u32;
+            segments.iter().map(|&(start, count)| {
+                let entry = (logical, count as u16, start);
+                logical += count as u32;
+                entry
+            }).collect()
+        };
+        let ib = Self::extent_root(&extent_entries);
         let i_blocks_512 = (nblocks * (self.block_size / 512)) as u32;
         let mode = entry.mode | 0o100000; // S_IFREG
 
@@ -697,13 +759,23 @@ impl Builder {
         } else {
             // Slow symlink: stored in data blocks
             let nblocks = (target_len as u64 + self.block_size - 1) / self.block_size;
-            let start_block = self.alloc_blocks(nblocks);
-            let file_off = start_block * self.block_size;
+            let segments = self.alloc_blocks(nblocks);
+
+            // Write symlink target to the first block of the first segment
+            let (seg_start, _) = segments[0];
+            let file_off = seg_start * self.block_size;
             self.file.seek(SeekFrom::Start(file_off))?;
             self.file.write_all(target)?;
 
-            let extent = [(0u32, nblocks as u16, start_block)];
-            let ib = Self::extent_root(&extent);
+            let extent_entries: Vec<(u32, u16, u64)> = {
+                let mut logical = 0u32;
+                segments.iter().map(|&(start, count)| {
+                    let entry = (logical, count as u16, start);
+                    logical += count as u32;
+                    entry
+                }).collect()
+            };
+            let ib = Self::extent_root(&extent_entries);
             let i_blocks_512 = (nblocks * (self.block_size / 512)) as u32;
             (ib, target_len as u64, i_blocks_512, EXT4_EXTENTS_FL)
         };
@@ -944,23 +1016,49 @@ impl Builder {
     // ── Finalize ────────────────────────────────────────────────────────────
 
     fn finalize(&mut self) -> Result<()> {
-        // Write block bitmap at block 2 (padded to block size, trailing bits set to 1)
-        let mut bm = self.block_bitmap.clone();
-        bm.resize(self.block_size as usize, 0xFF);
-        // Also mark bits beyond total_blocks as used (within the group)
-        for b in self.total_blocks..self.blocks_per_group as u64 {
-            set_bit(&mut bm, b);
-        }
-        let bm_off = 2 * self.block_size;
-        self.file.seek(SeekFrom::Start(bm_off))?;
-        self.file.write_all(&bm)?;
+        for g in 0..self.num_groups {
+            let base = g as u64 * self.blocks_per_group as u64;
+            let bm_byte_start = (base / 8) as usize;
+            let bm_byte_end = (((base + self.blocks_per_group as u64) + 7) / 8) as usize;
+            let mut bm = vec![0u8; self.block_size as usize];
+            // Copy bits for this group
+            let group_end = self.blocks_per_group as u64;
+            for i in 0..group_end {
+                let bit = base + i;
+                if bit < self.total_blocks && get_bit(&self.block_bitmap, bit) {
+                    set_bit(&mut bm, i);
+                }
+            }
+            // Set trailing bits to 1 (beyond block count but within group)
+            let last_data_bit = (self.total_blocks - base).min(group_end);
+            for i in last_data_bit..self.block_size as u64 * 8 {
+                set_bit(&mut bm, i);
+            }
 
-        // Write inode bitmap at block 3 (padded to block size, trailing bits set to 1)
-        let mut im = self.inode_bitmap.clone();
-        im.resize(self.block_size as usize, 0xFF);
-        let im_off = 3 * self.block_size;
-        self.file.seek(SeekFrom::Start(im_off))?;
-        self.file.write_all(&im)?;
+            let bm_off = (base + 2) * self.block_size;
+            self.file.seek(SeekFrom::Start(bm_off))?;
+            self.file.write_all(&bm)?;
+
+            // Inode bitmap for this group
+            let inode_base = g as u64 * self.inodes_per_group as u64;
+            let group_inodes = self.inodes_per_group as u64;
+            let mut im = vec![0u8; self.block_size as usize];
+            for i in 0..group_inodes {
+                let bit = inode_base + i;
+                if bit < self.total_inodes as u64 && get_bit(&self.inode_bitmap, bit) {
+                    set_bit(&mut im, i);
+                }
+            }
+            // Set trailing bits to 1
+            let last_inode_bit = (self.total_inodes as u64 - inode_base).min(group_inodes);
+            for i in last_inode_bit..self.block_size as u64 * 8 {
+                set_bit(&mut im, i);
+            }
+
+            let im_off = (base + 3) * self.block_size;
+            self.file.seek(SeekFrom::Start(im_off))?;
+            self.file.write_all(&im)?;
+        }
 
         // Rewrite group descriptors with final free counts
         self.write_group_descriptors()?;
@@ -978,6 +1076,82 @@ fn set_bit(bm: &mut [u8], bit: u64) {
     if byte < bm.len() {
         bm[byte] |= 1 << bit_in_byte;
     }
+}
+
+fn get_bit(bm: &[u8], bit: u64) -> bool {
+    let byte = (bit / 8) as usize;
+    let bit_in_byte = (bit % 8) as u8;
+    if byte < bm.len() {
+        bm[byte] & (1 << bit_in_byte) != 0
+    } else {
+        false
+    }
+}
+
+// Copy entry data into a flat Vec<u8> block by block
+fn make_dir_block_copy(entries: &[(u32, Vec<u8>, u8)], block_size: u64) -> Vec<u8> {
+    let bs = block_size as usize;
+    let mut blocks = Vec::new();
+    blocks.reserve(bs);
+    blocks.resize(bs, 0u8);
+
+    let mut off: usize = 0;
+    let mut prev_off: usize = 0;
+    let mut has_prev: bool = false;
+    let total = entries.len();
+
+    for idx in 0..total {
+        let this_ino = entries[idx].0;
+        let this_namelen = entries[idx].1.len();
+        let this_file_type = entries[idx].2;
+        let is_last = idx + 1 == total;
+
+        let raw_len = 8 + this_namelen;
+        let padded = ((raw_len + 3) / 4) * 4;
+
+        if off + padded > bs && (has_prev || is_last) {
+            if has_prev {
+                let rem = (bs - prev_off % bs) as u16;
+                blocks[prev_off + 4] = (rem & 0xff) as u8;
+                blocks[prev_off + 5] = (rem >> 8) as u8;
+            }
+            blocks.resize(blocks.len() + bs, 0u8);
+            off = blocks.len() - bs;
+            has_prev = false;
+        }
+
+        let reclen: u16 = if is_last { (bs - off % bs) as u16 } else { padded as u16 };
+
+        // Write inode (4 bytes LE)
+        blocks[off] = (this_ino & 0xff) as u8;
+        blocks[off + 1] = ((this_ino >> 8) & 0xff) as u8;
+        blocks[off + 2] = ((this_ino >> 16) & 0xff) as u8;
+        blocks[off + 3] = ((this_ino >> 24) & 0xff) as u8;
+
+        // Write rec_len (2 bytes LE)
+        blocks[off + 4] = (reclen & 0xff) as u8;
+        blocks[off + 5] = (reclen >> 8) as u8;
+
+        // Write name_len and file_type
+        blocks[off + 6] = this_namelen as u8;
+        blocks[off + 7] = this_file_type;
+
+        // Copy name bytes
+        let name = &entries[idx].1;
+        let mut copy_off = 0usize;
+        while copy_off < this_namelen {
+            blocks[off + 8 + copy_off] = name[copy_off];
+            copy_off += 1;
+        }
+
+        if !is_last {
+            prev_off = off;
+            has_prev = true;
+        }
+        off += reclen as usize;
+    }
+
+    blocks
 }
 
 fn now_unix_secs() -> u64 {
