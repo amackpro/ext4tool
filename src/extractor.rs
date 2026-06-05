@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 
-#[cfg(windows)]
-use std::os::windows::fs::symlink_file;
+fn unix_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
@@ -123,7 +124,7 @@ impl Extractor {
             }
 
             // Add to fs_config
-            let path_str = current_path.to_string_lossy().to_string();
+            let path_str = unix_path(&current_path);
             self.add_fs_config(&path_str, inode.i_uid, inode.i_gid, inode.permissions(), None, None);
         }
 
@@ -140,7 +141,7 @@ impl Extractor {
 
             // Check for spaces in filename
             if entry.name.contains(' ') {
-                self.files_with_spaces.lock().unwrap().push(entry_path.to_string_lossy().to_string());
+                self.files_with_spaces.lock().unwrap().push(unix_path(&entry_path));
             }
 
             // Read extended attributes
@@ -171,7 +172,7 @@ impl Extractor {
 
                     // Add directory to contexts
                     if let Some(ref label) = selinux_label {
-                        self.add_file_context(&entry_path.to_string_lossy(), label, true);
+                        self.add_file_context(&unix_path(&entry_path), label, true);
                     }
                 }
                 FileType::RegularFile => {
@@ -188,7 +189,7 @@ impl Extractor {
 
                     // Add to fs_config
                     self.add_fs_config(
-                        &entry_path.to_string_lossy(),
+                        &unix_path(&entry_path),
                         entry_inode.i_uid,
                         entry_inode.i_gid,
                         entry_inode.permissions(),
@@ -198,11 +199,10 @@ impl Extractor {
 
                     // Add to file_contexts
                     if let Some(ref label) = selinux_label {
-                        self.add_file_context(&entry_path.to_string_lossy(), label, false);
+                        self.add_file_context(&unix_path(&entry_path), label, false);
                     }
                 }
                 FileType::Symlink => {
-                    // Read symlink target
                     let target_data = volume.read_inode_data(&entry_inode)?;
                     let target = String::from_utf8_lossy(&target_data).to_string();
 
@@ -219,14 +219,26 @@ impl Extractor {
 
                     #[cfg(windows)]
                     {
-                        // On Windows, create a .lnk file or text file with target
-                        let mut link_file = fs::File::create(format!("{}.lnk", symlink_path.display()))?;
-                        link_file.write_all(target.as_bytes())?;
+                        // Create Windows native reparse point (matching Python version)
+                        let mut file = fs::File::create(&symlink_path)?;
+                        file.write_all(b"!<symlink>\xff\xfe")?;
+                        for c in target.chars() {
+                            let mut buf = [0u8; 4];
+                            let encoded = c.encode_utf8(&mut buf);
+                            file.write_all(encoded.as_bytes())?;
+                            file.write_all(&[0u8])?;
+                        }
+                        file.write_all(&[0u8; 2])?;
+                        file.sync_all()?;
+                        std::process::Command::new("attrib")
+                            .arg("+s")
+                            .arg(&symlink_path.as_os_str())
+                            .output().ok();
                     }
 
                     // Add to fs_config with target
                     self.add_fs_config(
-                        &entry_path.to_string_lossy(),
+                        &unix_path(&entry_path),
                         entry_inode.i_uid,
                         entry_inode.i_gid,
                         entry_inode.permissions(),
@@ -236,7 +248,7 @@ impl Extractor {
 
                     // Add to file_contexts
                     if let Some(ref label) = selinux_label {
-                        self.add_file_context(&entry_path.to_string_lossy(), label, false);
+                        self.add_file_context(&unix_path(&entry_path), label, false);
                     }
                 }
                 _ => {
