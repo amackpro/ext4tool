@@ -9,37 +9,30 @@ use std::fs;
 
 #[derive(Parser)]
 #[command(name = "ext4tool")]
-#[command(about = "Fast ext4 filesystem image extractor for Android/Linux/Windows", long_about = None)]
+#[command(about = "Extract ext4/sparse Android images", long_about = None)]
 #[command(version)]
 struct Args {
-    /// Input image file (can be .img or .simg)
+    /// Input image file (.img or .simg)
     #[arg(short = 'i', long = "input", value_name = "IMAGE")]
     input: PathBuf,
 
-    /// Output directory for extracted files
+    /// Output directory
     #[arg(short = 'o', long = "output", value_name = "DIR")]
     output: PathBuf,
 
-    /// Keep converted raw image (don't delete after extraction)
+    /// Keep converted raw image (don't delete)
     #[arg(short = 'k', long = "keep-raw")]
     keep_raw: bool,
 
-    /// Verbose output
-    #[arg(short = 'v', long = "verbose")]
-    verbose: bool,
-
-    /// Debug output (very detailed)
-    #[arg(short = 'd', long = "debug")]
-    debug: bool,
+    /// Number of threads (default: 4)
+    #[arg(short = 't', long = "threads", default_value = "4")]
+    threads: usize,
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let start = std::time::Instant::now();
 
-    // Set debug env var for other modules
-    if args.debug {
-        std::env::set_var("DEBUG", "1");
-    }
+    let args = Args::parse();
 
     println!("ext4tool v{}", env!("CARGO_PKG_VERSION"));
     println!("=====================================\n");
@@ -77,21 +70,19 @@ fn main() -> Result<()> {
         .to_string();
 
     // Extract the filesystem
-    let extractor = extractor::Extractor::new(&args.output, partition_name);
+    let extractor = extractor::Extractor::new(&args.output, partition_name, args.threads);
     extractor.extract(&image_path)?;
 
     // Cleanup temporary raw image if needed
     if is_sparse && !args.keep_raw {
         if let Err(e) = fs::remove_file(&image_path) {
             eprintln!("Warning: Failed to remove temporary raw image: {}", e);
-        } else if args.verbose {
-            println!("Removed temporary raw image: {}", image_path.display());
         }
     }
 
     println!("\n=====================================");
     println!("Output directory: {}", args.output.display());
-    println!("Extraction successful!");
+    println!("Extraction successful! ({:.2}s)", start.elapsed().as_secs_f64());
 
     Ok(())
 }
