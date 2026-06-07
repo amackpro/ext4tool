@@ -1,6 +1,6 @@
 # ext4tool
 
-Extracts files from ext4 filesystem images and builds ext4 images from directories. Written in Rust.
+Extracts files from ext4/sparse Android images and builds ext4 images from directories. Written in Rust.
 
 ## Build
 
@@ -8,21 +8,23 @@ Extracts files from ext4 filesystem images and builds ext4 images from directori
 cargo build --release
 ```
 
-No dependencies beyond Rust. Binary ends up at `target/release/ext4tool`.
+Binary at `target/release/ext4tool`. Works on Linux, Windows, and macOS.
 
 ## Usage
 
-```
+```sh
 ext4tool <command> [options]
 
 Commands:
-  extract    Extract files from an ext4 image
+  extract    Extract files from an ext4/sparse image
   build      Build an ext4 image from a source directory
 ```
 
+Set `DEBUG=1` for verbose diagnostic output (superblock details, extent trees, xattrs, file fragmentation).
+
 ### Extract
 
-```
+```sh
 ext4tool extract -i <image> -o <output_dir>
 
   -i, --input      ext4 image file (.img or .simg)
@@ -31,7 +33,7 @@ ext4tool extract -i <image> -o <output_dir>
   -t, --threads    number of worker threads (default: 4)
 ```
 
-Extracts all files from an ext4 image, preserving permissions, SELinux labels, capabilities, symlinks, and xattrs where supported. Output includes Android-compatible `fs_config` and `file_contexts` files for rebuilding images.
+Extracts all files preserving permissions, SELinux labels, capabilities, symlinks, and xattrs. Generates Android-compatible `fs_config` and `file_contexts` in `<output_dir>/config/`.
 
 ```sh
 ext4tool extract -i system.img -o out/
@@ -40,63 +42,59 @@ ext4tool extract -i vendor.simg -o out/ --keep-raw -t 8
 
 ### Build
 
-```
-ext4tool build -i <src_dir> -o <image> -s <size_mb>
+```sh
+ext4tool build -i <src_dir> -o <image> -s <size>
 
-  -i, --input     source directory
-  -o, --output    ext4 image file (.img)
-  -s, --size      target image size in MB
+  -i, --input            source directory
+  -o, --output           ext4 image file
+  -s, --size             image size (e.g. 4096M, 4G)
+  --block-size           block size in bytes (1024, 2048, 4096; default: 4096)
+  --reserved-percent     percentage of reserved blocks (default: 0)
+  --fs-config            fs_config file for uid/gid/mode overrides
+  --fs-contexts          file_contexts file for SELinux labels
+  --fs-contexts-prefix   mount point prefix (e.g. "vendor" for /vendor)
+  --sparse               output Android sparse format
 ```
 
-Builds an ext4 filesystem image from a source directory. Supports regular files, directories, and symlinks. Permissions (mode bits) are preserved. The resulting image passes `e2fsck` cleanly and is mountable via `mount -o loop`.
+Builds an ext4 image from a source directory. Supports regular files, directories, and symlinks. Permissions are preserved. The image passes `e2fsck` and is mountable.
+
+**fs_config / file_contexts validation**: when `--fs-config` or `--fs-contexts` is provided, every entry in the source directory **must** have a matching entry. Missing entries fail the build with a list of unmatched paths. Set `--fs-contexts-prefix` to match paths under a mount point (e.g. `vendor`).
+
+The volume label and `last mounted` field are set to the `--fs-contexts-prefix` value for partition identification.
 
 ```sh
-ext4tool build -i my_rootfs/ -o rootfs.img -s 256
+ext4tool build -i my_rootfs/ -o rootfs.img -s 256M
+ext4tool build -i vendor/ -o vendor.img -s 1024M \
+  --fs-config config/vendor_fs_config \
+  --fs-contexts config/vendor_file_contexts \
+  --fs-contexts-prefix vendor \
+  --sparse
 ```
 
-## Caveats
+## Features
 
-- Hard links are extracted as separate files.
-- Special files (device nodes, FIFOs, sockets) are skipped.
-- `chown` requires root on Linux.
-- Windows symlink creation uses MSYS2-compatible reparse points (`!<symlink>` + `attrib +s`). Requires Windows 10+ with Developer Mode for native NTFS symlinks; otherwise falls back to MSYS2-style reparse files which work with MSYS2 `mkfs.ext4`.
+| RoCompat | Incompat |
+|----------|----------|
+| SPARSE_SUPER | FILETYPE |
+| HUGE_FILE | EXTENTS |
+| DIR_NLINK | |
+| EXTRA_ISIZE | |
 
-## How extraction works
-
-Single-pass traversal + concurrent extraction:
-
-1. A single thread walks the directory tree, pushing regular file tasks to a shared queue and handling symlinks/directories inline.
-2. Worker threads pop from the queue and extract file data in parallel, each opening the image volume once at startup.
-3. Completion is signaled via `Condvar` — no busy-waiting.
-
-Metadata files go in `<output_dir>/config/`:
-- `<name>_fs_config` — per-file uid/gid/mode (includes symlink targets)
-- `<name>_file_contexts` — SELinux labels
-- `<name>_size.txt` — image size
-- `<name>_name.txt` — partition name
-- `<name>_space.txt` — files with spaces (if any)
-
-## How building works
-
-Two-phase build:
-
-1. **Walk + assign**: scan the source directory, build a file tree, and assign inode numbers.
-2. **BFS write**: write inodes, directory blocks, and file data level-by-level (parents before children) so that directory entries always reference existing inodes.
-
-Internal details:
-- 4096-byte blocks, 256-byte inodes, 2048 inodes/group, 32768 blocks/group
-- Extent-based file storage (single contiguous extent per file)
-- Inline symlinks (< 60 bytes stored directly in i_block)
-- No journal, 64-bit addressing, metadata_csum, or resize_inode features
+- 4096-byte blocks, 256-byte inodes, extent-based file storage
+- Inline symlinks (< 60 bytes stored in i_block)
+- 64-bit addressing, no journal, no metadata_csum
 
 ## Sparse images
 
-Android .simg files are detected by scanning the first 4 MB for the sparse magic (0xED26FF3A). The tool converts them to raw before extraction. Three chunk types are handled: RAW (copy data), FILL (repeat pattern), DONT_CARE (write zeros).
+Android `.simg` files are auto-detected by scanning for sparse magic `0xED26FF3A`. Three chunk types handled: RAW, FILL, DONT_CARE. Sparse output via `--sparse` flag.
+
+## Caveats
+
+- Hard links are extracted as separate files
+- Special files (device nodes, FIFOs, sockets) are skipped on Windows
+- `chown` requires root on Linux
+- Windows symlink creation uses MSYS2-compatible reparse points
 
 ## Python version
 
-There's also an original Python implementation (`ext4.py` + `imgextractor.py`). It does the same thing but slower and uses more memory. The Rust version is a direct rewrite, producing identical output.
-
-## License
-
-Rewrite of the original Python ext4 extractor. Refer to original licensing.
+Original Python implementation at `ext4.py` + `imgextractor.py` for reference. The Rust version produces identical output.
