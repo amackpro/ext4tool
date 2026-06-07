@@ -432,7 +432,7 @@ impl Builder {
         let nblocks = if size == 0 { 1u64 } else { (size + self.block_size - 1) / self.block_size };
         let segments = self.alloc_blocks(nblocks);
 
-        if segments.len() > 4 {
+        if std::env::var("DEBUG").is_ok() && segments.len() > 4 {
             eprintln!("\n>>> File with {} extents:", segments.len());
             eprintln!("    Path: {}", entry.rel_path.display());
             eprintln!("    Size: {} bytes ({} blocks)", size, nblocks);
@@ -598,12 +598,9 @@ pub fn build_image<P: AsRef<Path>>(
     builder.file.flush()?;
     drop(builder);
 
-    if sparse {
+        if sparse {
         println!("Converting to sparse image...");
-        eprintln!("  debug: raw_path={:?}, out_path={:?}", &build_path, &final_output);
-        eprintln!("  debug: raw_size={}", std::fs::metadata(&build_path).unwrap().len());
         crate::sparse::write_sparse_image(&build_path, &final_output)?;
-        eprintln!("  debug: keeping temp file for inspection");
     }
 
     println!("Done.");

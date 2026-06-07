@@ -123,7 +123,6 @@ impl Builder {
             self.next_data_block = actual;
         }
 
-        // Debug: check for invalid segments
         for &(start, count) in &segments {
             if start + count > self.total_blocks {
                 eprintln!("ERROR: alloc_blocks returned invalid segment: start={} count={} (total_blocks={})",

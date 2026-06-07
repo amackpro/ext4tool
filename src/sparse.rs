@@ -252,15 +252,6 @@ pub fn write_sparse_image<P: AsRef<Path>>(raw_path: P, sparse_path: P) -> Result
             CHUNK_TYPE_RAW
         };
 
-        if blk_idx == 0 {
-            let first_bytes: Vec<u8> = block[..std::cmp::min(32, blk_sz as usize)].to_vec();
-            eprintln!("  debug: block 0 first bytes: {:02x?}", first_bytes);
-            // Check superblock area
-            let sb_bytes: Vec<u8> = block[1024..1024+32].to_vec();
-            eprintln!("  debug: block 0 superblock area: {:02x?}", sb_bytes);
-            eprintln!("  debug: block 0 is_zero={}", is_zero);
-        }
-
         if chunks.is_empty() {
             current_type = expected_type;
             current_count = 1;
