@@ -1,0 +1,28 @@
+# Rust
+/target
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build outputs
+*.img
+*.img.raw
+*.simg
+output*/
+extracted*/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python (legacy)
+__pycache__/
+*.pyc
+*.pyo
