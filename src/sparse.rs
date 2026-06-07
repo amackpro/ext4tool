@@ -240,10 +240,10 @@ pub fn write_sparse_image<P: AsRef<Path>>(raw_path: P, sparse_path: P) -> Result
         count: u32,
     }
     let mut chunks: Vec<Pending> = Vec::new();
-    let mut current_type: u16 = CHUNK_TYPE_RAW; // placeholder, will be set on first block
+    let mut current_type: u16 = 0;
     let mut current_count: u32 = 0;
 
-    for blk_idx in 0..total_blks {
+    for _blk_idx in 0..total_blks {
         raw.read_exact(&mut block)?;
         let is_zero = block == zero_block;
         let expected_type = if is_zero {
@@ -252,7 +252,7 @@ pub fn write_sparse_image<P: AsRef<Path>>(raw_path: P, sparse_path: P) -> Result
             CHUNK_TYPE_RAW
         };
 
-        if chunks.is_empty() {
+        if current_count == 0 {
             current_type = expected_type;
             current_count = 1;
         } else if expected_type == current_type {

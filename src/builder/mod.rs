@@ -636,9 +636,10 @@ pub fn build_image<P: AsRef<Path>>(
     builder.file.flush()?;
     drop(builder);
 
-        if sparse {
+    if sparse {
         println!("Converting to sparse image...");
         crate::sparse::write_sparse_image(&build_path, &final_output)?;
+        std::fs::remove_file(&build_path).ok();
     }
 
     println!("Done.");
