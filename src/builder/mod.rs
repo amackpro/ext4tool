@@ -20,7 +20,7 @@ use xattr_multi::build_security_xattrs;
 // External imports
 use crate::ext4::{FileType, EXT4_ROOT_INODE};
 use anyhow::{Context, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -144,8 +144,9 @@ impl Builder {
         let mut fs_config_applied = 0;
         let mut capabilities_applied = 0;
         if let Some(config) = fs_config {
-            // Try to determine the prefix from fs_contexts_prefix or by checking config keys
             let prefix = fs_contexts_prefix.map(|s| s.trim_matches('/').to_string());
+
+            let mut matched_fsconfig: HashSet<u32> = HashSet::new();
 
             for entry in all_entries.values_mut() {
                 let rel_str = entry.rel_path.to_string_lossy();
@@ -177,9 +178,25 @@ impl Builder {
                         entry.capabilities = cfg.capabilities.clone();
                         capabilities_applied += 1;
                     }
+                    matched_fsconfig.insert(entry.inode);
                     fs_config_applied += 1;
                 }
             }
+
+            let unmatched_fs: Vec<String> = all_entries.iter()
+                .filter(|(&ino, _)| !matched_fsconfig.contains(&ino))
+                .map(|(_, e)| e.rel_path.to_string_lossy().replace('\\', "/"))
+                .collect();
+
+            if !unmatched_fs.is_empty() {
+                anyhow::bail!(
+                    "The following {} entr{} missing fs_config entries:\n  {}",
+                    unmatched_fs.len(),
+                    if unmatched_fs.len() == 1 { "y is" } else { "ies are" },
+                    unmatched_fs.join("\n  ")
+                );
+            }
+
             if fs_config_applied > 0 {
                 println!("Applied fs_config to {} entries ({} with capabilities)",
                     fs_config_applied, capabilities_applied);
@@ -206,6 +223,8 @@ impl Builder {
         if let Some(ref patterns) = compiled_patterns {
             let prefix = fs_contexts_prefix.map(|s| format!("/{}", s.trim_start_matches('/'))).unwrap_or_default();
 
+            let mut matched_contexts: HashSet<u32> = HashSet::new();
+
             for entry in all_entries.values_mut() {
                 let rel_str = entry.rel_path.to_string_lossy();
                 let rel_path = rel_str.replace('\\', "/");
@@ -226,9 +245,25 @@ impl Builder {
 
                 if let Some(ctx) = matched_context {
                     entry.selinux_context = Some(ctx);
+                    matched_contexts.insert(entry.inode);
                     selinux_applied += 1;
                 }
             }
+
+            let unmatched_ctx: Vec<String> = all_entries.iter()
+                .filter(|(&ino, _)| !matched_contexts.contains(&ino))
+                .map(|(_, e)| e.rel_path.to_string_lossy().replace('\\', "/"))
+                .collect();
+
+            if !unmatched_ctx.is_empty() {
+                anyhow::bail!(
+                    "The following {} entr{} missing file_contexts entries:\n  {}",
+                    unmatched_ctx.len(),
+                    if unmatched_ctx.len() == 1 { "y is" } else { "ies are" },
+                    unmatched_ctx.join("\n  ")
+                );
+            }
+
             if selinux_applied > 0 {
                 println!("Applied file_contexts to {} entries", selinux_applied);
             }
