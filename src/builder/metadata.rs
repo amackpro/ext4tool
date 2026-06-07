@@ -78,12 +78,20 @@ impl Builder {
             EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS);
         w32(&mut sb, 0x64,
             EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER
-            | EXT4_FEATURE_RO_COMPAT_LARGE_FILE
+            | EXT4_FEATURE_RO_COMPAT_HUGE_FILE
             | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
             | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE);
 
         let uuid = uuid::Uuid::new_v4();
         sb[0x68..0x68 + 16].copy_from_slice(uuid.as_bytes());
+
+        if let Some(ref label) = self.label {
+            let label_bytes = label.as_bytes();
+            let len = label_bytes.len().min(16);
+            sb[0x78..0x78 + len].copy_from_slice(&label_bytes[..len]);
+            let len2 = label_bytes.len().min(64);
+            sb[0x88..0x88 + len2].copy_from_slice(&label_bytes[..len2]);
+        }
 
         w16(&mut sb, 0xFE, 0);
 

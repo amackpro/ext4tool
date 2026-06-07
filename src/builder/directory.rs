@@ -5,11 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
 use std::time::UNIX_EPOCH;
-
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
 
 /// Create directory entry blocks
 /// Packs directory entries into blocks with proper alignment
@@ -128,15 +124,23 @@ where
                 FileType::Symlink
             } else if metadata.is_dir() {
                 FileType::Directory
-            } else if metadata.file_type().is_socket() {
-                FileType::Socket
-            } else if metadata.file_type().is_char_device() {
-                FileType::CharDevice
-            } else if metadata.file_type().is_block_device() {
-                FileType::BlockDevice
-            } else if metadata.file_type().is_fifo() {
-                FileType::Fifo
             } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    if metadata.file_type().is_socket() {
+                        FileType::Socket
+                    } else if metadata.file_type().is_char_device() {
+                        FileType::CharDevice
+                    } else if metadata.file_type().is_block_device() {
+                        FileType::BlockDevice
+                    } else if metadata.file_type().is_fifo() {
+                        FileType::Fifo
+                    } else {
+                        FileType::RegularFile
+                    }
+                }
+                #[cfg(not(unix))]
                 FileType::RegularFile
             };
 

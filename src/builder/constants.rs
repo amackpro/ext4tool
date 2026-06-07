@@ -27,7 +27,7 @@ pub(super) const INODES_PER_GROUP: u32 = 2048;
 pub(super) const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 pub(super) const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 pub(super) const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
-pub(super) const EXT4_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0008;
+pub(super) const EXT4_FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
 #[allow(unused)]
 pub(super) const EXT4_FEATURE_RO_COMPAT_GDT_CSUM: u32 = 0x0010;
 pub(super) const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;

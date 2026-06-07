@@ -25,7 +25,6 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
 use std::time::UNIX_EPOCH;
 
 /// Main builder for creating ext4 filesystems
@@ -48,6 +47,8 @@ pub struct Builder {
     dir_count_group: Vec<u16>,
 
     file: fs::File,
+
+    label: Option<String>,
 }
 
 impl Builder {
@@ -114,6 +115,7 @@ impl Builder {
             inode_bitmap,
             dir_count_group: vec![0u16; num_groups as usize],
             file,
+            label: None,
         };
 
         b.write_superblock()?;
@@ -324,6 +326,7 @@ impl Builder {
             }
         }
 
+        self.label = fs_contexts_prefix.map(|s| s.trim_matches('/').to_string());
         self.finalize()?;
         Ok(())
     }
