@@ -65,7 +65,8 @@ pub fn build_security_xattrs(selinux_context: Option<&str>, capabilities: Option
 
     // Write entries and collect value offsets
     let mut pos = 4;
-    let mut value_offset = (header_size + entries_size + terminator_size) as u16;
+    // e_value_offs is relative to after the magic header (offset 4), not offset 0
+    let mut value_offset = (entries_size + terminator_size) as u16;
 
     for (name, value) in &attrs {
         let name_len = name.len() as u8;
@@ -107,6 +108,7 @@ pub fn build_security_xattrs(selinux_context: Option<&str>, capabilities: Option
         xattr[pos..pos + value.len()].copy_from_slice(value);
         pos += value.len();
     }
+
 
     Some(xattr)
 }

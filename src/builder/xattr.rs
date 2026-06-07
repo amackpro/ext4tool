@@ -45,10 +45,10 @@ pub fn build_selinux_xattr(context: &str) -> Option<Vec<u8>> {
 
     let header_size = 4; // magic only
 
-    // For inline xattrs, e_value_offs is relative to the xattr area start (after i_extra_isize)
-    // NOT relative to the inode start!
+    // For inline xattrs, e_value_offs is relative to AFTER the magic header
     // Xattr area layout: [magic:4] [entry:padded] [terminator:4] [value:value_size]
-    let value_offset = (header_size + entry_padded + terminator_size) as u16;
+    // e_value_offs points to value position relative to offset 4 (after magic)
+    let value_offset = (entry_padded + terminator_size) as u16;
 
     // Size of xattr data (not including inode offset)
     let xattr_data_size = value_offset as usize + value_size as usize;
