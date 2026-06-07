@@ -1,7 +1,8 @@
+mod config;
 mod ext4;
 mod sparse;
 mod extractor;
-mod build;
+mod builder;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -47,10 +48,54 @@ enum Command {
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
 
-        /// Image size in MB (minimum 64)
-        #[arg(short = 's', long = "size", default_value = "64")]
-        size_mb: u64,
+        /// Image size (e.g. 4096M, 4G, 4294967296; default MB)
+        #[arg(short = 's', long = "size", default_value = "64M")]
+        size: String,
+
+        /// Block size in bytes (1024, 2048, or 4096)
+        #[arg(long = "block-size", default_value = "4096")]
+        block_size: u64,
+
+        /// Percentage of reserved blocks (0-50)
+        #[arg(long = "reserved-percent", default_value = "0")]
+        reserved_percent: u32,
+
+        /// fs_config file for uid/gid/mode overrides
+        #[arg(long = "fs-config")]
+        fs_config: Option<PathBuf>,
+
+        /// file_contexts file for SELinux labels
+        #[arg(long = "fs-contexts")]
+        file_contexts: Option<PathBuf>,
+
+        /// Mount point prefix for file_contexts matching (e.g., "vendor" for /vendor partition)
+        #[arg(long = "fs-contexts-prefix")]
+        fs_contexts_prefix: Option<String>,
+
+        /// Output sparse image (Android sparse format)
+        #[arg(long = "sparse")]
+        sparse: bool,
     },
+}
+
+/// Parse a size string with optional suffix (K, M, G). No suffix = bytes.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty string".into());
+    }
+    let (num_str, mult) = if let Some((n, sfx)) = s.split_at_checked(s.len() - 1) {
+        match sfx.to_uppercase().as_str() {
+            "K" => (n, 1024u64),
+            "M" => (n, 1024u64 * 1024),
+            "G" => (n, 1024u64 * 1024 * 1024),
+            _ => (s, 1u64), // no suffix or "B" — raw bytes
+        }
+    } else {
+        (s, 1u64)
+    };
+    let num: u64 = num_str.parse().map_err(|_| format!("invalid number '{}'", num_str))?;
+    Ok(num * mult)
 }
 
 fn main() -> Result<()> {
@@ -109,16 +154,37 @@ fn main() -> Result<()> {
             println!("Output directory: {}", output.display());
             println!("Extraction successful! ({:.2}s)", start.elapsed().as_secs_f64());
         }
-        Command::Build { input, output, size_mb } => {
+        Command::Build { input, output, size, block_size, reserved_percent, fs_config, file_contexts, fs_contexts_prefix, sparse } => {
             if !input.is_dir() {
                 eprintln!("Error: Source is not a directory: {}", input.display());
                 std::process::exit(1);
             }
+
+            let size_bytes = parse_size(&size)
+                .unwrap_or_else(|e| { eprintln!("Error: invalid size '{}': {}", size, e); std::process::exit(1); });
+
+            // Parse fs_config if provided
+            let fs_config_map = if let Some(ref path) = fs_config {
+                Some(config::parse_fs_config(path)?)
+            } else {
+                None
+            };
+
+            // Parse file_contexts if provided
+            let file_contexts_map = if let Some(ref path) = file_contexts {
+                Some(config::parse_file_contexts(path)?)
+            } else {
+                None
+            };
+
             println!("Building ext4 image from: {}", input.display());
             println!("Output: {}", output.display());
-            println!("Target size: {} MB\n", size_mb);
+            println!("Target size: {} bytes\n", size_bytes);
 
-            build::build_image(&input, &output, size_mb)?;
+            builder::build_image(
+                &input, &output, size_bytes, block_size, reserved_percent,
+                fs_config_map, file_contexts_map, fs_contexts_prefix, sparse,
+            )?;
 
             println!("\n=====================================");
             println!("Image built: {}", output.display());
