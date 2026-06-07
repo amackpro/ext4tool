@@ -3,48 +3,82 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-/// Parse an Android fs_config file into a path→(uid,gid,mode) map.
-/// Format: `<rel_path> [extra...] <uid> <gid> <mode> [capabilities=...]`
-pub fn parse_fs_config<P: AsRef<Path>>(path: P) -> Result<HashMap<String, (u32, u32, u16)>> {
+/// Parsed fs_config entry with all fields
+#[derive(Debug, Clone)]
+pub struct FsConfigEntry {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub capabilities: Option<String>,
+}
+
+/// Parse an Android fs_config file into a path→FsConfigEntry map.
+/// Format: `<rel_path> [symlink_target] <uid> <gid> <mode> [capabilities=...]`
+///
+/// Examples:
+///   system/bin/app_process 0 2000 0755
+///   system/bin/ping 0 0 0755 capabilities=0x4000000a
+///   system/lib/libcutils.so 0 0 0644
+pub fn parse_fs_config<P: AsRef<Path>>(path: P) -> Result<HashMap<String, FsConfigEntry>> {
     let content = fs::read_to_string(path.as_ref())
         .with_context(|| format!("Failed to read fs_config: {}", path.as_ref().display()))?;
     let mut map = HashMap::new();
-    for line in content.lines() {
+
+    for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 {
+            eprintln!("Warning: fs_config line {}: too few fields, skipping", line_num + 1);
             continue;
         }
-        // The path is the first field
+
+        // Parse path (first field)
         let path = fields[0].to_string();
-        // Scan from end: last field may be capabilities=...
-        // Fields before that: uid, gid, mode (last 3 regular fields)
-        let mut idx = fields.len() - 1;
-        if fields[idx].starts_with("capabilities=") {
-            idx -= 1;
+
+        // Parse capabilities if present (last field starting with "capabilities=")
+        let mut capabilities = None;
+        let mut last_idx = fields.len() - 1;
+
+        if fields[last_idx].starts_with("capabilities=") {
+            if let Some(caps) = fields[last_idx].strip_prefix("capabilities=") {
+                capabilities = Some(caps.to_string());
+            }
+            last_idx -= 1;
         }
-        // Now idx points to last field before optional capabilities
-        // We need: ... uid gid mode [extra1 extra2 ...]
-        // So the last 3 are mode, gid, uid
-        if idx < 2 {
+
+        // Now parse uid, gid, mode from the end (before capabilities)
+        // Format: ... <uid> <gid> <mode> [capabilities=...]
+        if last_idx < 2 {
+            eprintln!("Warning: fs_config line {}: invalid format, skipping", line_num + 1);
             continue;
         }
-        let mode_str = fields[idx];
-        let gid_str = fields[idx - 1];
-        let uid_str = fields[idx - 2];
 
-        let mode = u16::from_str_radix(mode_str.trim_start_matches("0"), 8)
-            .map_err(|e| anyhow::anyhow!("Bad mode '{}': {}", mode_str, e))?;
+        let mode_str = fields[last_idx];
+        let gid_str = fields[last_idx - 1];
+        let uid_str = fields[last_idx - 2];
+
+        // Parse mode (octal)
+        let mode = u16::from_str_radix(mode_str.trim_start_matches('0'), 8)
+            .with_context(|| format!("fs_config line {}: bad mode '{}'", line_num + 1, mode_str))?;
+
+        // Parse uid and gid
         let uid: u32 = uid_str.parse()
-            .map_err(|e| anyhow::anyhow!("Bad uid '{}': {}", uid_str, e))?;
+            .with_context(|| format!("fs_config line {}: bad uid '{}'", line_num + 1, uid_str))?;
         let gid: u32 = gid_str.parse()
-            .map_err(|e| anyhow::anyhow!("Bad gid '{}': {}", gid_str, e))?;
+            .with_context(|| format!("fs_config line {}: bad gid '{}'", line_num + 1, gid_str))?;
 
-        map.insert(path, (uid, gid, mode));
+        map.insert(path, FsConfigEntry {
+            uid,
+            gid,
+            mode,
+            capabilities,
+        });
     }
+
     Ok(map)
 }
 

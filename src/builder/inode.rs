@@ -1,4 +1,3 @@
-use super::constants::{XATTR_MAGIC, XATTR_SECURITY_PREFIX, XATTR_SELINUX_SUFFIX};
 use super::Builder;
 use anyhow::Result;
 use byteorder::{ByteOrder, LittleEndian};
@@ -100,55 +99,4 @@ impl Builder {
 
         Ok(())
     }
-}
-
-/// Build inline xattr data for security.selinux
-/// Returns the xattr bytes to append after the inode, or None if context is empty
-#[allow(dead_code)]
-pub(super) fn build_selinux_xattr(context: &str) -> Option<Vec<u8>> {
-    if context.is_empty() {
-        return None;
-    }
-
-    let context_bytes = context.as_bytes();
-    let name = XATTR_SELINUX_SUFFIX;
-    let name_len = name.len() as u8;
-    let value_size = context_bytes.len() as u32;
-
-    let entry_base_size = 1 + 1 + 2 + 4 + 4 + 4;
-    let entry_total = entry_base_size + name_len as usize;
-    let entry_padded = (entry_total + 3) & !3;
-
-    let header_size = 4;
-    let value_offset_within_xattr = header_size + entry_padded;
-    let total_size = value_offset_within_xattr + value_size as usize;
-
-    const XATTR_START_IN_INODE: u16 = 156;
-    let value_offset_in_inode = XATTR_START_IN_INODE + value_offset_within_xattr as u16;
-
-    let mut xattr = vec![0u8; total_size];
-
-    LittleEndian::write_u32(&mut xattr[0..4], XATTR_MAGIC);
-
-    let mut pos = 4;
-    xattr[pos] = name_len;
-    pos += 1;
-    xattr[pos] = XATTR_SECURITY_PREFIX;
-    pos += 1;
-    LittleEndian::write_u16(&mut xattr[pos..pos+2], value_offset_in_inode);
-    pos += 2;
-    LittleEndian::write_u32(&mut xattr[pos..pos+4], 0);
-    pos += 4;
-    LittleEndian::write_u32(&mut xattr[pos..pos+4], value_size);
-    pos += 4;
-
-    let hash: u32 = 0;
-    LittleEndian::write_u32(&mut xattr[pos..pos+4], hash);
-    pos += 4;
-
-    xattr[pos..pos + name_len as usize].copy_from_slice(name);
-
-    xattr[value_offset_within_xattr..value_offset_within_xattr + value_size as usize].copy_from_slice(context_bytes);
-
-    Some(xattr)
 }

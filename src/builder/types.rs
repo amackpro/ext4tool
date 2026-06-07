@@ -16,6 +16,7 @@ pub(super) struct FileEntry {
     pub(super) source_path: Option<PathBuf>,
     pub(super) rel_path: PathBuf,
     pub(super) selinux_context: Option<String>,
+    pub(super) capabilities: Option<String>,
 }
 
 /// Tree node for directory hierarchy

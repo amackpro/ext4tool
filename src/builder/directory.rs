@@ -250,6 +250,7 @@ where
             source_path,
             rel_path: raw.relative.clone(),
             selinux_context: None,
+            capabilities: None,
         };
         entries.insert(ino, fe);
     }

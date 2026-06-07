@@ -6,6 +6,8 @@ mod extent;
 mod inode;
 mod metadata;
 mod types;
+mod xattr;
+mod xattr_multi;
 
 // Internal imports
 use allocation::set_bit;
@@ -13,6 +15,7 @@ use constants::*;
 use directory::{make_dir_block, walk_directory_tree};
 use extent::build_extent_root;
 use types::{FileEntry, FileNode};
+use xattr_multi::build_security_xattrs;
 
 // External imports
 use crate::ext4::{FileType, EXT4_ROOT_INODE};
@@ -122,7 +125,7 @@ impl Builder {
     pub fn build_from_dir<P: AsRef<Path>>(
         &mut self,
         src_dir: P,
-        fs_config: Option<&HashMap<String, (u32, u32, u16)>>,
+        fs_config: Option<&HashMap<String, crate::config::FsConfigEntry>>,
         file_contexts: Option<&Vec<(String, String)>>,
         fs_contexts_prefix: Option<&str>,
     ) -> Result<()> {
@@ -137,24 +140,47 @@ impl Builder {
 
         // Apply fs_config
         let mut fs_config_applied = 0;
+        let mut capabilities_applied = 0;
         if let Some(config) = fs_config {
+            // Try to determine the prefix from fs_contexts_prefix or by checking config keys
+            let prefix = fs_contexts_prefix.map(|s| s.trim_matches('/').to_string());
+
             for entry in all_entries.values_mut() {
                 let rel_str = entry.rel_path.to_string_lossy();
-                let rel_str = rel_str.replace('\\', "/");
-                let matched = config.get(rel_str.as_str())
-                    .or_else(|| {
-                        let with_slash = format!("/{}", rel_str);
-                        config.get(with_slash.as_str())
-                    });
-                if let Some(&(uid, gid, mode)) = matched {
-                    entry.uid = uid;
-                    entry.gid = gid;
-                    entry.mode = mode;
+                let rel_path = rel_str.replace('\\', "/");
+
+                // Try multiple path variants for matching
+                let paths_to_try: Vec<String> = if let Some(ref pfx) = prefix {
+                    vec![
+                        rel_path.clone(),                    // as-is: "bin/cnd"
+                        format!("/{}", rel_path),            // with leading slash: "/bin/cnd"
+                        format!("{}/{}", pfx, rel_path),     // with prefix: "vendor/bin/cnd"
+                        format!("/{}/{}", pfx, rel_path),    // with both: "/vendor/bin/cnd"
+                    ]
+                } else {
+                    vec![
+                        rel_path.clone(),
+                        format!("/{}", rel_path),
+                    ]
+                };
+
+                let matched = paths_to_try.iter()
+                    .find_map(|path| config.get(path));
+
+                if let Some(cfg) = matched {
+                    entry.uid = cfg.uid;
+                    entry.gid = cfg.gid;
+                    entry.mode = cfg.mode;
+                    if cfg.capabilities.is_some() {
+                        entry.capabilities = cfg.capabilities.clone();
+                        capabilities_applied += 1;
+                    }
                     fs_config_applied += 1;
                 }
             }
             if fs_config_applied > 0 {
-                println!("Applied fs_config to {} entries", fs_config_applied);
+                println!("Applied fs_config to {} entries ({} with capabilities)",
+                    fs_config_applied, capabilities_applied);
             }
         }
 
@@ -173,6 +199,7 @@ impl Builder {
         };
 
         // Apply file_contexts
+        // Android SELinux uses LAST matching pattern, not first!
         let mut selinux_applied = 0;
         if let Some(ref patterns) = compiled_patterns {
             let prefix = fs_contexts_prefix.map(|s| format!("/{}", s.trim_start_matches('/'))).unwrap_or_default();
@@ -186,16 +213,22 @@ impl Builder {
                     format!("/{}", rel_path)
                 };
 
+                // Find ALL matching patterns and use the LAST one (most specific)
+                let mut matched_context: Option<String> = None;
                 for (re, context) in patterns {
                     if re.is_match(&path_str) {
-                        entry.selinux_context = Some(context.clone());
-                        selinux_applied += 1;
-                        break;
+                        matched_context = Some(context.clone());
+                        // Don't break - keep looking for more specific matches
                     }
+                }
+
+                if let Some(ctx) = matched_context {
+                    entry.selinux_context = Some(ctx);
+                    selinux_applied += 1;
                 }
             }
             if selinux_applied > 0 {
-                println!("Applied file_contexts to {} entries (writing as inline xattrs)", selinux_applied);
+                println!("Applied file_contexts to {} entries", selinux_applied);
             }
         }
 
@@ -214,11 +247,23 @@ impl Builder {
         let mut root_gid_final = root_gid;
         let mut root_mode_final = root_mode;
         if let Some(config) = fs_config {
-            let matched = config.get("/").or_else(|| config.get(""));
-            if let Some(&(uid, gid, mode)) = matched {
-                root_uid_final = uid;
-                root_gid_final = gid;
-                root_mode_final = mode;
+            // Try multiple root path variants
+            let pfx_str = fs_contexts_prefix.map(|s| s.trim_matches('/').to_string());
+            let with_slash = pfx_str.as_ref().map(|s| format!("/{}", s));
+
+            let root_paths: Vec<&str> = if let Some(ref pfx) = pfx_str {
+                vec!["/", "", pfx.as_str(), with_slash.as_ref().unwrap().as_str()]
+            } else {
+                vec!["/", ""]
+            };
+
+            let matched = root_paths.iter()
+                .find_map(|path| config.get(*path));
+
+            if let Some(cfg) = matched {
+                root_uid_final = cfg.uid;
+                root_gid_final = cfg.gid;
+                root_mode_final = cfg.mode;
             }
         }
 
@@ -227,10 +272,11 @@ impl Builder {
             let prefix = fs_contexts_prefix.map(|s| format!("/{}", s.trim_start_matches('/'))).unwrap_or_else(|| "/".to_string());
             let root_path = if prefix == "/" { "/" } else { &prefix };
 
+            // Use LAST matching pattern (most specific)
             for (re, context) in patterns {
                 if re.is_match(root_path) {
                     root_selinux = Some(context.clone());
-                    break;
+                    // Don't break - keep looking
                 }
             }
         }
@@ -247,6 +293,7 @@ impl Builder {
             source_path: None,
             rel_path: PathBuf::from(""),
             selinux_context: root_selinux,
+            capabilities: None,
         });
 
         // Write all non-directory entries
@@ -370,7 +417,10 @@ impl Builder {
             links_count,
         );
 
-        let xattr: Option<Vec<u8>> = None;
+        let xattr = build_security_xattrs(
+            entry.selinux_context.as_deref(),
+            entry.capabilities.as_deref()
+        );
         self.write_inode_with_xattr(parent_ino, &inode_data, xattr.as_deref())?;
 
         Ok(())
@@ -438,7 +488,10 @@ impl Builder {
         let mode = entry.mode | 0o100000;
 
         let inode_data = self.make_inode(mode, entry.uid, entry.gid, size, EXT4_EXTENTS_FL, i_blocks_512, &ib, entry.mtime, 1);
-        let xattr: Option<Vec<u8>> = None;
+        let xattr = build_security_xattrs(
+            entry.selinux_context.as_deref(),
+            entry.capabilities.as_deref()
+        );
         self.write_inode_with_xattr(ino, &inode_data, xattr.as_deref())?;
         Ok(())
     }
@@ -476,7 +529,10 @@ impl Builder {
 
         let mode = entry.mode | 0o120000;
         let inode_data = self.make_inode(mode, entry.uid, entry.gid, size, flags, i_blocks_512, &ib, entry.mtime, 1);
-        let xattr: Option<Vec<u8>> = None;
+        let xattr = build_security_xattrs(
+            entry.selinux_context.as_deref(),
+            entry.capabilities.as_deref()
+        );
         self.write_inode_with_xattr(ino, &inode_data, xattr.as_deref())?;
         Ok(())
     }
@@ -520,7 +576,7 @@ pub fn build_image<P: AsRef<Path>>(
     size_bytes: u64,
     block_size: u64,
     reserved_pct: u32,
-    fs_config: Option<HashMap<String, (u32, u32, u16)>>,
+    fs_config: Option<HashMap<String, crate::config::FsConfigEntry>>,
     file_contexts: Option<Vec<(String, String)>>,
     fs_contexts_prefix: Option<String>,
     sparse: bool,
